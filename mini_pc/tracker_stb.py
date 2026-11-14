@@ -4,6 +4,8 @@
 # - PID untuk pan (kiri-kanan, GPIO18) dan tilt (atas-bawah, GPIO19)
 # - Mode kontrol bisa diganti: PID  <->  IF-ELSE (langkah tetap), dari webserver
 # - Grafik error real-time (untuk melihat steady state) di webserver
+# - Grafik sudut servo: sudut REAL vs sudut TARGET (pan dan tilt)
+# - Data Logger CSV: tombol Mulai Rekam / Stop & Simpan di web -> folder HASIL/Hasil_N.csv
 # - Kirim sudut ke ESP32 lewat UART TTL
 # - Webserver: lihat kamera + atur PID, arah, flip, batas sudut secara manual
 #
@@ -15,10 +17,15 @@
 # Jalankan:  python3 tracker_stb.py
 # Buka di browser:  http://<ip-stb>:5000
 
+import atexit
 import copy
+import csv
 import json
 import os
+import re
+import signal
 import socket
+import sys
 import threading
 import time
 from collections import deque
@@ -37,10 +44,16 @@ FILE_CONFIG = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                            "config_tracking.json")
 LEBAR, TINGGI, FPS_KAMERA = 640, 480, 30
 KIRIM_MAKS_HZ = 50
+DIR_SKRIP = os.path.dirname(os.path.abspath(__file__))
+DIR_HASIL = os.path.join(DIR_SKRIP, "HASIL")   # folder hasil rekaman CSV
+HEADER_CSV = ["Time_ms", "SP_X", "PV_X", "Err_X", "P_X", "I_X", "D_X", "Out_PID_X", "Sudut_Pan",
+              "SP_Y", "PV_Y", "Err_Y", "P_Y", "I_Y", "D_Y", "Out_PID_Y", "Sudut_Tilt"]
 
 CONFIG_DEFAULT = {
     "tracking": True,            # True = otomatis, False = servo manual
     "mode_pid": True,            # True = PID, False = IF-ELSE (langkah tetap)
+    "fov_h": 60.0,               # sudut pandang horizontal kamera (derajat)
+    "fov_v": 45.0,               # sudut pandang vertikal kamera (derajat)
     "flip_h": False,             # balik gambar kiri-kanan
     "flip_v": False,             # balik gambar atas-bawah
     "tampil_mask": False,        # tampilkan mask deteksi (untuk tuning warna)
@@ -99,11 +112,16 @@ class PID:
         self.err_lalu = 0.0
 
     def hitung(self, err, kp, ki, kd, dt):
+        """Hitung PID memakai error ternormalisasi (-1..1).
+        Mengembalikan (total, P, I, D) semuanya dalam derajat/detik."""
         self.integral += err * dt
         self.integral = max(-1.0, min(1.0, self.integral))  # anti-windup
         turunan = (err - self.err_lalu) / dt if dt > 0 else 0.0
         self.err_lalu = err
-        return kp * err + ki * self.integral + kd * turunan  # derajat/detik
+        p_term = kp * err
+        i_term = ki * self.integral
+        d_term = kd * turunan
+        return p_term + i_term + d_term, p_term, i_term, d_term
 
 
 # ===================== SERIAL KE ESP32 =====================
@@ -143,9 +161,88 @@ esp = KomunikasiESP32()
 # ===================== STATUS BERSAMA =====================
 status = {"jpeg": None, "pan": 90.0, "tilt": 90.0, "ditemukan": False, "fps": 0.0}
 
-# riwayat untuk grafik: (waktu, error_pan, error_tilt, sudut_pan, sudut_tilt)
+# riwayat untuk grafik: (waktu, error_pan, error_tilt, sudut_pan, sudut_tilt,
+#                       target_pan, target_tilt)
 riwayat = deque(maxlen=400)   # 20 Hz -> sekitar 20 detik
 T0 = time.time()
+
+
+# ===================== DATA LOGGER CSV =====================
+# Semua akses ke dict `rekam` dilakukan di dalam `with lock:` (lock yang sama
+# dengan config/status), jadi aman antar-thread (loop kontrol vs request web).
+rekam = {"aktif": False, "file": None, "writer": None, "nama": "",
+         "t_mulai_rekam": None, "baris": 0, "t_flush": 0.0,
+         "terakhir_nama": "", "terakhir_baris": 0}
+
+
+def nomor_hasil_tertinggi():
+    """Pindai folder HASIL, kembalikan nomor urut tertinggi (0 jika kosong)."""
+    tertinggi = 0
+    for nama in os.listdir(DIR_HASIL):
+        m = re.fullmatch(r"Hasil_(\d+)\.csv", nama)
+        if m:
+            tertinggi = max(tertinggi, int(m.group(1)))
+    return tertinggi
+
+
+def mulai_rekam():
+    """Buka Hasil_<N+1>.csv baru dan tulis header. Mengembalikan nama file."""
+    with lock:
+        if rekam["aktif"]:
+            return rekam["nama"]
+        os.makedirs(DIR_HASIL, exist_ok=True)
+        nomor = nomor_hasil_tertinggi() + 1
+        while True:
+            nama = "Hasil_%d.csv" % nomor
+            try:
+                # mode "x" = gagal kalau file sudah ada, jadi file lama tidak pernah tertimpa
+                f = open(os.path.join(DIR_HASIL, nama), "x", newline="", encoding="utf-8")
+                break
+            except FileExistsError:
+                nomor += 1
+        writer = csv.writer(f)
+        writer.writerow(HEADER_CSV)
+        f.flush()
+        rekam.update(aktif=True, file=f, writer=writer, nama=nama,
+                     t_mulai_rekam=None,   # diisi di frame pertama -> Time_ms mulai dari 0
+                     baris=0, t_flush=time.time())
+        print("[INFO] Rekaman dimulai: %s" % os.path.join("HASIL", nama))
+        return nama
+
+
+def _tutup_rekam_locked():
+    """Tutup file CSV dengan aman. HARUS dipanggil saat `lock` sudah dipegang."""
+    if not rekam["aktif"]:
+        return None
+    nama, baris = rekam["nama"], rekam["baris"]
+    try:
+        rekam["file"].flush()
+        os.fsync(rekam["file"].fileno())
+    except Exception:
+        pass
+    try:
+        rekam["file"].close()
+    except Exception as e:
+        print("[PERINGATAN] Gagal menutup file CSV:", e)
+    rekam.update(aktif=False, file=None, writer=None, t_mulai_rekam=None,
+                 terakhir_nama=nama, terakhir_baris=baris)
+    print("[INFO] Rekaman disimpan: %s (%d baris)" % (os.path.join("HASIL", nama), baris))
+    return nama, baris
+
+
+def stop_rekam():
+    with lock:
+        return _tutup_rekam_locked()
+
+
+def _status_rekam_locked():
+    """Ringkasan status rekaman. HARUS dipanggil saat `lock` sudah dipegang."""
+    durasi = 0.0
+    if rekam["aktif"] and rekam["t_mulai_rekam"] is not None:
+        durasi = time.time() - rekam["t_mulai_rekam"]
+    return {"aktif": rekam["aktif"], "nama": rekam["nama"], "baris": rekam["baris"],
+            "durasi": round(durasi, 1),
+            "terakhir_nama": rekam["terakhir_nama"], "terakhir_baris": rekam["terakhir_baris"]}
 
 
 def hitung_ifelse(err, langkah, deadzone):
@@ -226,6 +323,8 @@ def loop_kontrol():
 
         # ---- kontrol ----
         err_x_g = err_y_g = None   # untuk grafik
+        tgt_pan_g = tgt_tilt_g = None
+        pid_x = pid_y = (0.0, 0.0, 0.0, 0.0)   # (total, P, I, D) untuk CSV
         if c["tracking"]:
             if target is not None:
                 cx, cy, (bx, by, bw, bh) = target
@@ -236,6 +335,11 @@ def loop_kontrol():
                 err_x_g, err_y_g = ex, ey   # error asli (sebelum zona mati)
                 p, t = c["pan"], c["tilt"]
 
+                # sudut TARGET = sudut servo yang dibutuhkan agar objek tepat di tengah
+                # gambar (dari posisi objek di kamera dan FOV kamera)
+                tgt_pan_g = pan + (-1 if p["invert"] else 1) * ex * c["fov_h"] / 2.0
+                tgt_tilt_g = tilt + (-1 if t["invert"] else 1) * ey * c["fov_v"] / 2.0
+
                 if c["mode_pid"]:
                     # ---- mode PID ----
                     if abs(ex) < c["deadzone"]:
@@ -244,14 +348,17 @@ def loop_kontrol():
                     if abs(ey) < c["deadzone"]:
                         ey = 0.0
                         pid_tilt.integral = 0.0
-                    out_pan = pid_pan.hitung(ex, p["kp"], p["ki"], p["kd"], dt)
-                    out_tilt = pid_tilt.hitung(ey, t["kp"], t["ki"], t["kd"], dt)
+                    pid_x = pid_pan.hitung(ex, p["kp"], p["ki"], p["kd"], dt)
+                    pid_y = pid_tilt.hitung(ey, t["kp"], t["ki"], t["kd"], dt)
+                    out_pan, out_tilt = pid_x[0], pid_y[0]
                 else:
                     # ---- mode IF-ELSE (PID dimatikan) ----
                     pid_pan.reset()
                     pid_tilt.reset()
                     out_pan = hitung_ifelse(ex, p["step"], c["deadzone"])
                     out_tilt = hitung_ifelse(ey, t["step"], c["deadzone"])
+                    pid_x = (out_pan, 0.0, 0.0, 0.0)    # tanpa komponen P/I/D
+                    pid_y = (out_tilt, 0.0, 0.0, 0.0)
                 pan += (-1 if p["invert"] else 1) * out_pan * dt
                 tilt += (-1 if t["invert"] else 1) * out_tilt * dt
 
@@ -279,6 +386,37 @@ def loop_kontrol():
             esp.kirim(pan, tilt)
             t_kirim = sekarang
 
+        # ---- data logger CSV (hanya jika tombol Mulai Rekam sudah ditekan) ----
+        with lock:
+            if rekam["aktif"]:
+                try:
+                    if rekam["t_mulai_rekam"] is None:
+                        rekam["t_mulai_rekam"] = sekarang    # baris pertama: Time_ms = 0
+                    t_ms = int((sekarang - rekam["t_mulai_rekam"]) * 1000)
+                    sp_x, sp_y = lebar / 2.0, tinggi / 2.0
+                    if target is not None:
+                        pv_x, pv_y = target[0], target[1]
+                        err_x_px, err_y_px = round(sp_x - pv_x, 2), round(sp_y - pv_y, 2)
+                        nx, ny = pid_x, pid_y
+                    else:
+                        # objek hilang: PV/Err kosong, P/I/D/Out = 0.0, waktu & sudut tetap tercatat
+                        pv_x = pv_y = err_x_px = err_y_px = ""
+                        nx = ny = (0.0, 0.0, 0.0, 0.0)
+                    def b(x, n=4):          # pembulatan; "+ 0.0" mengubah -0.0 menjadi 0.0
+                        return round(x, n) + 0.0
+                    rekam["writer"].writerow([
+                        t_ms, sp_x, pv_x, err_x_px,
+                        b(nx[1]), b(nx[2]), b(nx[3]), b(nx[0]), b(pan, 2),
+                        sp_y, pv_y, err_y_px,
+                        b(ny[1]), b(ny[2]), b(ny[3]), b(ny[0]), b(tilt, 2)])
+                    rekam["baris"] += 1
+                    if sekarang - rekam["t_flush"] >= 1.0:   # flush tiap 1 detik
+                        rekam["file"].flush()
+                        rekam["t_flush"] = sekarang
+                except Exception as e:
+                    print("[ERROR] Gagal menulis CSV, rekaman dihentikan:", e)
+                    _tutup_rekam_locked()
+
         # ---- rekam untuk grafik (20 Hz) ----
         if sekarang - t_rekam >= 0.05:
             t_rekam = sekarang
@@ -286,7 +424,9 @@ def loop_kontrol():
                 riwayat.append((round(sekarang - T0, 3),
                                 None if err_x_g is None else round(err_x_g, 4),
                                 None if err_y_g is None else round(err_y_g, 4),
-                                round(pan, 1), round(tilt, 1)))
+                                round(pan, 1), round(tilt, 1),
+                                None if tgt_pan_g is None else round(batas(tgt_pan_g, 0, 180), 1),
+                                None if tgt_tilt_g is None else round(batas(tgt_tilt_g, 0, 180), 1)))
 
         # ---- gambar overlay ----
         cv2.line(tampilan, (lebar // 2, 0), (lebar // 2, tinggi), (255, 255, 0), 1)
@@ -330,6 +470,8 @@ HTML = """<!doctype html>
  #st{font-size:13px;color:#9f9}
  canvas{background:#000;border:1px solid #444;border-radius:6px;max-width:100%;display:block;margin-top:6px}
  select{background:#222;color:#eee;border:1px solid #555;padding:3px}
+ button.merah{background:#a33}
+ #rek{font-size:15px;font-weight:bold;margin:6px 0;font-variant-numeric:tabular-nums}
 </style></head><body>
 <h2>Tracker Merah - Pan/Tilt PID</h2>
 <div class="wrap">
@@ -341,10 +483,18 @@ HTML = """<!doctype html>
    <option value="0.05">0.05</option></select></div>
   <canvas id="gp" width="640" height="150"></canvas>
   <canvas id="gt" width="640" height="150"></canvas>
-  <div id="ss" style="font-size:13px;color:#fc8;margin-top:6px"></div></div>
+  <div id="ss" style="font-size:13px;color:#fc8;margin-top:6px"></div>
+  <h3>Grafik Sudut Servo (real vs target)</h3>
+  <canvas id="sa" width="640" height="170"></canvas>
+  <canvas id="sb" width="640" height="170"></canvas>
+  <div id="ssa" style="font-size:13px;color:#fc8;margin-top:6px"></div></div>
  <div>
   <div class="panel"><h3>Umum</h3><div id="umum"></div>
    <button onclick="tengah()">Servo ke tengah (90)</button></div>
+  <div class="panel"><h3>Data Logger (CSV)</h3>
+   <div id="rek" style="color:#9aa">IDLE</div>
+   <button onclick="rekam('mulai')">Mulai Rekam</button>
+   <button class="merah" onclick="rekam('stop')">Stop &amp; Simpan</button></div>
   <div class="panel"><h3>Pan (kiri-kanan, GPIO18)</h3><div id="pan"></div></div>
   <div class="panel"><h3>Tilt (atas-bawah, GPIO19)</h3><div id="tilt"></div></div>
  </div>
@@ -355,7 +505,8 @@ const UMUM=[["tracking","Tracking AUTO","cek"],["mode_pid","Mode PID (off = IF-E
  ["flip_v","Balik gambar atas-bawah","cek"],["tampil_mask","Tampil mask","cek"],
  ["min_area","Luas min","sl",50,5000,50],["deadzone","Zona mati","sl",0,0.3,0.005],
  ["s_min","S min (HSV)","sl",0,255,1],["v_min","V min (HSV)","sl",0,255,1],
- ["timeout_hilang","Timeout hilang (s)","sl",0,15,0.5]];
+ ["timeout_hilang","Timeout hilang (s)","sl",0,15,0.5],
+ ["fov_h","FOV horizontal kamera","sl",20,120,1],["fov_v","FOV vertikal kamera","sl",15,100,1]];
 const AXIS=[["kp","Kp","sl",0,200,0.5],["ki","Ki","sl",0,100,0.1],["kd","Kd","sl",0,50,0.1],
  ["step","Langkah IF-ELSE (deg/s)","sl",1,200,1],["invert","Balik arah servo","cek"],["min","Sudut min","sl",0,180,1],
  ["max","Sudut max","sl",0,180,1],["manual","Manual (AUTO off)","sl",0,180,1]];
@@ -380,6 +531,7 @@ function buat(el,awal,def){
   }
   document.getElementById(el).appendChild(d);
 }
+function rekam(aksi){fetch('/api/rekam/'+aksi,{method:'POST'});}
 function tengah(){
   fetch('/api/center',{method:'POST'}).then(()=>location.reload());
 }
@@ -390,6 +542,11 @@ fetch('/api/config').then(r=>r.json()).then(c=>{
   AXIS.forEach(d=>buat('tilt','tilt',d));
 });
 setInterval(()=>fetch('/api/status').then(r=>r.json()).then(s=>{
+  const rk=s.rekam,el=document.getElementById('rek');
+  if(rk.aktif){el.style.color='#f66';
+    el.textContent='MEREKAM: '+rk.nama+'  |  '+rk.durasi.toFixed(1)+' dtk  |  '+rk.baris+' baris';}
+  else{el.style.color='#9aa';
+    el.textContent='IDLE'+(rk.terakhir_nama?'  (tersimpan terakhir: '+rk.terakhir_nama+', '+rk.terakhir_baris+' baris)':'');}
   document.getElementById('st').textContent=
    `Pan ${s.pan.toFixed(1)}  Tilt ${s.tilt.toFixed(1)}  | Objek: ${s.ditemukan?'ADA':'tidak ada'}  | Serial ESP32: ${s.serial?'OK':'TERPUTUS'}  | ${s.fps.toFixed(1)} FPS`;
 }),500);
@@ -407,12 +564,45 @@ function gambar(id,data,idx,judul,dz,sk,warna){
   g.fillStyle='#ccc';g.font='12px sans-serif';
   g.fillText(judul+'   (garis hijau = zona mati, skala \u00b1'+sk+', 15 detik)',6,14);
 }
+function gambarSudut(id,data,iR,iT,judul){
+  const cv=document.getElementById(id),g=cv.getContext('2d'),W=cv.width,H=cv.height;
+  g.clearRect(0,0,W,H);
+  const jendela=15,tn=data.length?data[data.length-1][0]:0;
+  const vis=data.filter(d=>tn-d[0]<=jendela);
+  const nilai=[];vis.forEach(d=>{[iR,iT].forEach(i=>{if(d[i]!==null)nilai.push(d[i]);});});
+  g.fillStyle='#ccc';g.font='12px sans-serif';
+  g.fillText(judul+'   (biru = real, merah putus-putus = target, 15 detik)',6,14);
+  if(!nilai.length)return;
+  let mn=Math.min(...nilai),mx=Math.max(...nilai);
+  if(mx-mn<10){const m=(mx+mn)/2;mn=m-5;mx=m+5;}
+  const pad=(mx-mn)*0.12;mn-=pad;mx+=pad;
+  const Y=v=>H-(v-mn)/(mx-mn)*(H-24)-4;
+  g.strokeStyle='#333';g.lineWidth=1;
+  for(let k=0;k<=4;k++){const v=mn+(mx-mn)*k/4,y=Y(v);
+    g.beginPath();g.moveTo(0,y);g.lineTo(W,y);g.stroke();
+    g.fillStyle='#888';g.fillText(v.toFixed(0)+'\u00b0',W-34,y-2);}
+  const garis=(idx,warna,putus)=>{
+    g.strokeStyle=warna;g.lineWidth=2;g.setLineDash(putus);g.beginPath();let buka=false;
+    vis.forEach(d=>{const v=d[idx];if(v===null){buka=false;return;}
+      const x=W-(tn-d[0])/jendela*W,y=Y(v);
+      if(!buka){g.moveTo(x,y);buka=true;}else g.lineTo(x,y);});
+    g.stroke();g.setLineDash([]);g.lineWidth=1;};
+  garis(iT,'#f55',[6,4]);
+  garis(iR,'#4af',[]);
+}
 setInterval(()=>fetch('/api/grafik').then(r=>r.json()).then(data=>{
   if(!cfg.deadzone&&cfg.deadzone!==0)return;
   const sk=parseFloat(document.getElementById('skala').value),dz=cfg.deadzone;
   gambar('gp',data,1,'Error Pan (kiri-kanan)',dz,sk,'#4af');
   gambar('gt',data,2,'Error Tilt (atas-bawah)',dz,sk,'#fa4');
+  gambarSudut('sa',data,3,5,'Sudut Pan (kiri-kanan)');
+  gambarSudut('sb',data,4,6,'Sudut Tilt (atas-bawah)');
   const tn=data.length?data[data.length-1][0]:0;
+  const selisih=(iR,iT)=>{const a=data.filter(d=>d[iR]!==null&&d[iT]!==null&&tn-d[0]<=2)
+    .map(d=>Math.abs(d[iT]-d[iR]));return a.length?(a.reduce((x,y)=>x+y,0)/a.length):null;};
+  const fd=v=>v===null?'-':v.toFixed(2)+'\u00b0';
+  document.getElementById('ssa').textContent=
+    'Selisih rata-rata |target - real| 2 detik terakhir  ->  Pan: '+fd(selisih(3,5))+'  |  Tilt: '+fd(selisih(4,6));
   const rata=idx=>{const a=data.filter(d=>d[idx]!==null&&tn-d[0]<=2).map(d=>Math.abs(d[idx]));
     return a.length?(a.reduce((x,y)=>x+y,0)/a.length):null;};
   const f=v=>v===null?'-':v.toFixed(3);
@@ -481,7 +671,26 @@ def api_center():
 def api_status():
     with lock:
         return jsonify(pan=status["pan"], tilt=status["tilt"],
-                       ditemukan=status["ditemukan"], fps=status["fps"], serial=esp.ok)
+                       ditemukan=status["ditemukan"], fps=status["fps"], serial=esp.ok,
+                       rekam=_status_rekam_locked())
+
+
+@app.route("/api/rekam/mulai", methods=["POST"])
+def api_rekam_mulai():
+    try:
+        nama = mulai_rekam()
+        return jsonify(ok=True, nama=nama)
+    except Exception as e:
+        print("[ERROR] Gagal memulai rekaman:", e)
+        return jsonify(ok=False, pesan=str(e)), 500
+
+
+@app.route("/api/rekam/stop", methods=["POST"])
+def api_rekam_stop():
+    hasil = stop_rekam()
+    if hasil is None:
+        return jsonify(ok=True, nama=None, baris=0)
+    return jsonify(ok=True, nama=hasil[0], baris=hasil[1])
 
 
 @app.route("/api/grafik")
@@ -502,7 +711,15 @@ def ip_lokal():
         return "IP-STB"
 
 
+def _keluar_aman(*_):
+    """Dipanggil saat SIGTERM: keluar normal supaya blok finally/atexit menutup CSV."""
+    sys.exit(0)
+
+
 if __name__ == "__main__":
+    os.makedirs(DIR_HASIL, exist_ok=True)
+    atexit.register(stop_rekam)                 # jaga-jaga: CSV selalu ditutup saat keluar
+    signal.signal(signal.SIGTERM, _keluar_aman)
     muat_config()
     esp.buka()
     threading.Thread(target=loop_kontrol, daemon=True).start()
@@ -510,4 +727,9 @@ if __name__ == "__main__":
     print("[INFO] Webserver aktif. Buka di browser:")
     print("       http://%s:%d" % (ip_lokal(), WEB_PORT))
     print("=" * 50)
-    app.run(host="0.0.0.0", port=WEB_PORT, threaded=True, use_reloader=False)
+    try:
+        app.run(host="0.0.0.0", port=WEB_PORT, threaded=True, use_reloader=False)
+    except KeyboardInterrupt:
+        print("\n[INFO] Ctrl+C diterima, menutup program...")
+    finally:
+        stop_rekam()                            # flush + close CSV dengan aman
